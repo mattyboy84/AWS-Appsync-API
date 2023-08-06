@@ -1,0 +1,18 @@
+image: public.ecr.aws/sam/build-nodejs18.x:latest
+
+stages:
+  - deploy
+
+variables:
+  STACK_NAME: appsync-graphql-api
+  REGION: eu-west-2
+
+deploy:
+  stage: deploy
+  script:
+    - sam build
+    - sam package --output-template-file packaged.yaml --s3-bucket $S3_DEPLOY_BUCKET --region $REGION
+    # with domain resources
+    - sam deploy --no-fail-on-empty-changeset --template-file packaged.yaml --stack-name $STACK_NAME --s3-bucket $S3_DEPLOY_BUCKET --capabilities CAPABILITY_NAMED_IAM --region $REGION --parameter-overrides domainName=$ROUTE_53_DOMAIN domainCertArn=$ROUTE_53_DOMAIN_CERT_US_EAST_1 hostedZoneId=$ROUTE_53_DOMAIN_ID
+    # without domain resources
+    #- sam deploy --no-fail-on-empty-changeset --template-file packaged.yaml --stack-name $STACK_NAME --s3-bucket $S3_DEPLOY_BUCKET --capabilities CAPABILITY_NAMED_IAM --region $REGION

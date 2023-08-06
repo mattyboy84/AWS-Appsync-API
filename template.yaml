@@ -1,0 +1,267 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+
+Parameters:
+  TargetEnvironment:
+    Type: String
+    Default: dev
+    AllowedValues:
+      - dev
+      - prod
+##########################
+  #ROUTE 53 HOSTING PARAMS
+  hostedZoneId:
+    Type: String
+    Description: Id of the doamin hosted zone. - leave blank to omit
+    Default: ''
+  domainName:
+    Type: String
+    Description: optional name of domain name to register to the api
+    Default: ''
+  domainCertArn: 
+    Type: String
+    Description: optional ARN of the domain's certificate registered in route 53 - must be in us-east-1
+    Default: ''
+  subDomainName:
+    Type: String
+    Description: optional sub domain name - leave empty to omit
+    Default: ''
+  
+Conditions:
+  IsDomainConfigured:
+    !And
+      - !Not [!Equals [!Ref hostedZoneId, '']]
+      - !Not [!Equals [!Ref domainName, '']]
+      - !Not [!Equals [!Ref domainCertArn, '']]
+  IsSubDomainConfigured:
+    !And
+      - !Not [!Equals [!Ref hostedZoneId, '']]
+      - !Not [!Equals [!Ref domainName, '']]
+      - !Not [!Equals [!Ref subDomainName, '']]
+      - !Not [!Equals [!Ref domainCertArn, '']]
+  
+Resources:
+###################
+###### ROLES ######
+###################
+  APIloggingRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${AWS::StackName}-APIloggingRole"
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - appsync.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Path: "/"
+      ManagedPolicyArns:
+        - "arn:aws:iam::aws:policy/service-role/AWSAppSyncPushToCloudWatchLogs"
+  
+  dynamoStoreRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${AWS::StackName}-dynamoStoreRole"
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - appsync.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Path: "/"
+      Policies:
+        - PolicyName: !Sub "${AWS::StackName}-dynamoStoreRole-policy"
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - "dynamodb:GetItem"
+                  - "dynamodb:PutItem"
+                Resource: !GetAtt postsTable.Arn
+  
+###################
+### POSTS TABLE ###
+###################
+  
+  postsTable:
+    Type: AWS::DynamoDB::Table
+    Properties: 
+      TableName: !Sub "${AWS::StackName}-postsTable"
+      BillingMode: PROVISIONED
+      TableClass: STANDARD
+      TimeToLiveSpecification:
+        Enabled: true
+        AttributeName: ttl
+      AttributeDefinitions:
+        - AttributeName: id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: id
+          KeyType: "HASH"
+      ProvisionedThroughput: 
+        ReadCapacityUnits: 1
+        WriteCapacityUnits: 1
+  
+#########################
+###### GRAPHQL API ######
+#########################
+  
+  GraphQLApi:
+    Type: AWS::AppSync::GraphQLApi
+    Properties:
+      Name: !Sub "${AWS::StackName}-GraphQLApi"
+      ApiType: GRAPHQL
+      AuthenticationType: API_KEY
+      LogConfig:
+        CloudWatchLogsRoleArn: !GetAtt APIloggingRole.Arn
+        ExcludeVerboseContent: false
+        FieldLogLevel: ALL #Can be NONE, ERROR or ALL
+      OwnerContact: I am the owner
+      Visibility: GLOBAL #Can be GLOBAL or PRIVATE
+      XrayEnabled: true
+  
+  GraphQLApiLogs:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Join ['', ['/aws/appsync/apis/', !GetAtt GraphQLApi.ApiId]]
+  
+  GraphQLApiKey:
+    Type: AWS::AppSync::ApiKey
+    Properties: 
+      ApiId: !GetAtt GraphQLApi.ApiId
+  
+  GraphQLApiSchema:
+    Type: AWS::AppSync::GraphQLSchema
+    Properties: 
+      ApiId: !GetAtt GraphQLApi.ApiId
+      Definition:
+        !Sub |
+          schema {
+              query: Query
+              mutation: Mutation
+          }
+          
+          type Query {
+              getPost(id: ID!): Post
+          }
+          
+          type Mutation {
+              addPost(
+                  author: String!
+                  title: String!
+                  content: String!
+                  url: String!
+              ): Post!
+          }
+          
+          type Post {
+              id: ID!
+              author: String
+              title: String
+              content: String
+              url: String
+              ups: Int!
+              downs: Int!
+              version: Int!
+          }
+  
+  DynamoDataSource:
+    Type: AWS::AppSync::DataSource
+    Properties:
+      Name: DynamoDataSource
+      ApiId: !GetAtt GraphQLApi.ApiId
+      Type: AMAZON_DYNAMODB
+      ServiceRoleArn: !GetAtt dynamoStoreRole.Arn
+      DynamoDBConfig:
+        TableName: !Ref postsTable
+        AwsRegion: !Ref AWS::Region
+  
+  addPostResolver:
+    Type: "AWS::AppSync::Resolver"
+    Properties:
+      ApiId: !GetAtt GraphQLApi.ApiId
+      DataSourceName: !GetAtt DynamoDataSource.Name
+      TypeName: Mutation
+      FieldName: addPost
+      RequestMappingTemplate: |
+        {
+          "version" : "2017-02-28",
+          "operation" : "PutItem",
+          "key" : {
+            "id" : $util.dynamodb.toDynamoDBJson($util.autoId())
+          },
+          "attributeValues" : {
+            "author" : $util.dynamodb.toDynamoDBJson($context.arguments.author),
+            "title" : $util.dynamodb.toDynamoDBJson($context.arguments.title),
+            "content" : $util.dynamodb.toDynamoDBJson($context.arguments.content),
+            "url" : $util.dynamodb.toDynamoDBJson($context.arguments.url),
+          }
+        }
+      ResponseMappingTemplate: |
+        $utils.toJson($context.result)
+  
+  getPostResolver:
+    Type: "AWS::AppSync::Resolver"
+    Properties:
+      ApiId: !GetAtt GraphQLApi.ApiId
+      DataSourceName: !GetAtt DynamoDataSource.Name
+      TypeName: Query
+      FieldName: getPost
+      RequestMappingTemplate: |
+        {
+          "version" : "2017-02-28",
+          "operation" : "GetItem",
+          "key" : {
+            "id" : $util.dynamodb.toDynamoDBJson($ctx.args.id)
+          }
+        }
+      ResponseMappingTemplate: |
+        $utils.toJson($context.result)
+  
+  GraphQLApiDomain:
+    Type: AWS::AppSync::DomainName
+    Condition: IsDomainConfigured
+    Properties: 
+      CertificateArn: !Ref domainCertArn
+      Description: domain configuration for the GraphQLApi
+      DomainName: !If [IsSubDomainConfigured, !Sub "${subDomainName}.${domainName}", !Ref domainName]
+  
+  GraphQLApiDomainAssociation:
+    Type: AWS::AppSync::DomainNameApiAssociation
+    Condition: IsDomainConfigured
+    Properties: 
+      ApiId: !GetAtt GraphQLApi.ApiId
+      DomainName: !Ref GraphQLApiDomain
+  
+  GraphQLApiDistributionRecord:
+    Type: AWS::Route53::RecordSet
+    Condition: IsDomainConfigured
+    Properties:
+      Name: !If
+        - IsSubDomainConfigured
+        - !Sub "${subDomainName}.${domainName}"
+        - !Ref domainName
+      HostedZoneId: !Ref hostedZoneId
+      Type: CNAME
+      ResourceRecords:
+        - !GetAtt GraphQLApiDomain.AppSyncDomainName
+      TTL: 300
+  
+Outputs:
+  GraphQLApiUrl:
+    Value: !If
+      - IsDomainConfigured
+      - !If
+        - IsSubDomainConfigured
+        - !Sub "https://${subDomainName}.${domainName}/graphql"
+        - !Sub "https://${domainName}/graphql"
+      - !GetAtt GraphQLApi.GraphQLUrl
+  GraphQLApiKey:
+    Value: !GetAtt GraphQLApiKey.ApiKey
